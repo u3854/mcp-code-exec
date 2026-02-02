@@ -1,0 +1,7 @@
+fastmcp>=2.14.4
+scikit-learn
+numpy
+pandas
+sympy
+beautifulsoup4
+requests
