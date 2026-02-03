@@ -102,7 +102,6 @@ def audit_hook(event, args):
 def _initialize_worker_environment():
     """Sets up the sandbox and pre-loads libraries."""
     
-    # 1. PRE-LOAD YOUR CODE (The "Friends" List)
     # We import the executor module here. Python reads the file NOW.
     # Because the hook isn't active yet, this is allowed.
     try:
