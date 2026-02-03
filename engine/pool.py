@@ -13,46 +13,90 @@ multiprocessing.set_start_method("spawn", force=True)
 log = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-BASE_DIR = os.getcwd()
-SANDBOX_DIR = os.path.join(BASE_DIR, "sandbox")
-ALLOWED_PATHS = [SANDBOX_DIR]
+# 1. DEFINE PATHS
+BASE_DIR = os.getcwd()                # /app
+SANDBOX_DIR = os.path.join(BASE_DIR, "sandbox") # /app/sandbox
+
+# This is where 'pip' puts things. It is NOT inside /app.
+USER_LIB_DIR = os.path.join(os.environ.get("HOME", "/home/mcp-user"), ".local") 
+
+# 2. THE WHITELIST
+# We allow the sandbox (data) and the libraries (tools).
+ALLOWED_PATHS = [SANDBOX_DIR, USER_LIB_DIR]
+
 PRELOAD_LIBRARIES = ["math", "numpy", "sympy", "pandas"]
 PROCESSPOOL_SIZE = 4
 
+
 def audit_hook(event, args):
-    """
-    Intercepts low-level Python events.
-    We care about 'open' and 'os.listdir' events.
-    """
-    # Block subprocess usage completely
-    if event == "subprocess.Popen":
-        raise PermissionError("Subprocess execution is restricted.")
-    
+    # ---------------------------------------------------------
+    # 1. BLOCK SHELL INJECTION (os.system)
+    # ---------------------------------------------------------
+    # Pip never uses os.system. This is always a user attack.
+    if event == "os.system":
+        raise PermissionError("System call 'os.system' is forbidden.")
+
+    # ---------------------------------------------------------
+    # 2. CHECK PROCESS EXECUTION (Popen AND posix_spawn)
+    # ---------------------------------------------------------
+    # Python's subprocess module calls os.posix_spawn internally.
+    # We must audit both events using the same whitelist logic.
+    if event in ["subprocess.Popen", "os.posix_spawn"]:
+        
+        # Extract arguments based on the event type
+        # subprocess.Popen args: (executable, args, cwd, env)
+        # os.posix_spawn args:   (path, argv, env)
+        # In both cases, index [1] is the argument list we need to check.
+        cmd_args = args[1]
+        
+        # WHITELIST CHECK: Is this "python -m pip"?
+        is_pip = False
+        if cmd_args and len(cmd_args) >= 3:
+            # Look for: ['/path/to/python', '-m', 'pip', ...]
+            # We check the first arg loosely (ends with python) 
+            # and the next two strictly.
+            exe = str(cmd_args[0])
+            if (exe.endswith("python") or exe.endswith(f"python{sys.version_info.major}.{sys.version_info.minor}")) and \
+               cmd_args[1] == "-m" and \
+               cmd_args[2] == "pip":
+                is_pip = True
+        
+        if is_pip:
+            return # ALLOW SAFE INSTALLATION
+            
+        # If it's not pip, it's a blocked command (like 'ls', 'bash', 'curl')
+        # logging.warning(f"Blocked Execution: {cmd_args}")
+        raise PermissionError(f"Process execution '{event}' is restricted to package installation.")
+
+    # ---------------------------------------------------------
+    # 3. FILE SYSTEM CONTROL
+    # ---------------------------------------------------------
     if event == "open" or event == "os.listdir":
         path = args[0]
-        if isinstance(path, int): # If it's a file descriptor, it's usually safe/internal
+        if isinstance(path, int): 
             return
-            
-        # Resolve absolute path to check against allowed list
-        abs_path = os.path.abspath(path)
         
-        # Check if the path starts with our sandbox directory
-        is_allowed = False
-        for safe_path in ALLOWED_PATHS:
-            # Ensure safe_path ends with a separator to prevent prefix matching (e.g. /sandbox vs /sandbox_secret)
-            safe_path_guarded = os.path.join(safe_path, "") 
-            
-            # Check if it matches exactly OR is a subpath
-            if abs_path == safe_path or abs_path.startswith(safe_path_guarded):
-                is_allowed = True
-                break
-        
-        # Special exceptions (LLM needs to import libraries)
-        if abs_path.startswith("/usr/local/lib") or abs_path.startswith("/usr/lib"):
-             is_allowed = True
+        try:
+            abs_path = os.path.abspath(path)
+        except Exception:
+            return
 
-        if not is_allowed:
-            raise PermissionError(f"Access denied: {path} is outside the sandbox.")
+        # WHITELIST CHECK
+        allowed = False
+        for safe_dir in ALLOWED_PATHS:
+            try:
+                if os.path.commonpath([safe_dir, abs_path]) == safe_dir:
+                    allowed = True
+                    break
+            except ValueError:
+                continue
+        
+        # Allow System Libraries (read-only usually)
+        if not allowed and (abs_path.startswith("/usr/lib") or abs_path.startswith("/usr/local/lib")):
+            allowed = True
+
+        if not allowed:
+            raise PermissionError(f"Access to {abs_path} is denied.")
 
 
 def _initialize_worker_environment():
@@ -88,6 +132,13 @@ def worker_main(task_conn: Connection, result_conn: Connection):
     """The persistent process loop."""
     task_conn.close()
     signal.signal(signal.SIGINT, signal.SIG_IGN) # Ignore Ctrl+C
+
+    # --- CONFIGURE LOGGING FOR THIS CHILD PROCESS ---
+    logging.basicConfig(
+        level=logging.INFO,
+        format=f'[Worker-{os.getpid()}] %(name)s - %(levelname)s - %(message)s',
+        force=True # Overwrite any default settings
+    )
 
     # --- INITIALIZATION ---
     try:

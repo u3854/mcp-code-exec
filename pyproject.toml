@@ -4,13 +4,13 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = [
-    "fastmcp>=2.14.4",
-]
+dependencies = []
 
 [dependency-groups]
 test = [
-    "numpy>=2.4.2",
-    "pandas>=3.0.0",
-    "sympy>=1.14.0",
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
+    "langchain>=1.2.7",
+    "langchain-mcp-adapters>=0.2.1",
+    "langchain-openai>=1.1.7",
 ]

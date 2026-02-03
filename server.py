@@ -26,10 +26,6 @@ INSTALL_TIMEOUT = 120
 
 @asynccontextmanager
 async def server_lifespan(server: FastMCP):
-    """
-    This runs BEFORE the server starts accepting requests
-    and AFTER the server shuts down.
-    """
     # 1. Startup Logic
     logger.info("🚀 Lifespan: Starting Worker Pool...")
     start_worker_pool(max_workers=MAX_WORKERS, max_backlog=MAX_BACKLOG)
@@ -48,6 +44,9 @@ mcp = FastMCP("mcp-code-exec", lifespan=server_lifespan)
 async def execute_python_code(
         code: Annotated[str, Field(description="Python code")]
 ) -> dict:
+    """
+    Code execution sandbox. Returns `stdout` and `stderr`.
+    """
     
     # 1. Pre-Flight Check (Runs in Main Process)
     # This is fast and tells us if we need to extend the clock.
@@ -56,20 +55,29 @@ async def execute_python_code(
     # 2. Decide Timeout dynamically
     execution_timeout = INSTALL_TIMEOUT if missing_libs else EXECUTION_TIMEOUT
     
-    # 3. Dispatch to Worker
-    pool = get_worker_pool()
-    if not pool:
-        return {"pool": pool}
-    _wid, res = await pool.run(
-        fn=execute_user_code,
-        execution_timeout=execution_timeout, # <--- DYNAMIC TIMEOUT
-        queue_timeout=QUEUE_TIMEOUT,
-        # Pass arguments to the function
-        code=code,
-        packages_to_install=missing_libs
-    )
+    try:
+        # 3. Dispatch to Worker
+        pool = get_worker_pool()
+        if not pool:
+            return {"pool": pool}
+        _wid, res = await pool.run(
+            fn=execute_user_code,
+            execution_timeout=execution_timeout, # <--- DYNAMIC TIMEOUT
+            queue_timeout=QUEUE_TIMEOUT,
+            # Pass arguments to the function
+            code=code,
+            packages_to_install=missing_libs
+        )
+        return res
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "stdout": "",
+            "stderr": "",
+            "error": str(e)
+        }
     
-    return res
 
 if __name__ == "__main__":
     mcp.run()

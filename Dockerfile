@@ -5,41 +5,45 @@ FROM python:3.13-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system utilities (optional, but good for debugging)
-# We clean up apt cache to keep image small
+# Install system utilities
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user and group
+# --- CHANGE 1: Create User & Fix Permissions ---
 RUN groupadd -r mcp-group && useradd -r -g mcp-group mcp-user
 
-# Set the working directory
+# --- CHANGE 2: Set HOME explicitly ---
+# Without this, 'pip install --user' doesn't know where to go, or defaults to /
+ENV HOME=/home/mcp-user
+ENV PATH="${HOME}/.local/bin:${PATH}"
+
+# Create the home directory structure explicitly
+RUN mkdir -p ${HOME}/.local/bin \
+    && mkdir -p ${HOME}/.cache \
+    && chown -R mcp-user:mcp-group ${HOME} \
+    && chmod -R 755 ${HOME}
+
 WORKDIR /app
 
-# 1. Install Dependencies first (Caching layer)
+# Install Dependencies (System Level)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 2. Setup File System & Sandbox
-# Create the sandbox directory
-RUN mkdir -p /app/sandbox
+# Setup Sandbox
+RUN mkdir -p /app/sandbox \
+    && mkdir -p /app/engine
 
 # Copy application code
 COPY . /app
 
-# 3. Permissions
-# Give mcp-user ownership of the app directory
-# Crucial: This ensures it can write to /app/sandbox
+# Permissions
 RUN chown -R mcp-user:mcp-group /app
 
 # Switch to non-root user
 USER mcp-user
 
-# Expose port (if using HTTP/SSE transport)
 EXPOSE 8000
 
-# Entrypoint
-# By default, FastMCP runs in stdio mode. 
-# You can pass args to this command to switch to SSE if needed.
-CMD ["fastmcp", "run", "server.py:mcp", "--port", "8000", "--transport", "http", "--host", "0.0.0.0"]
+# Use the fastmcp CLI command
+CMD ["fastmcp", "run", "server.py:mcp", "--transport", "http", "--port", "8000", "--host", "0.0.0.0"]
