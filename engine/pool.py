@@ -13,16 +13,23 @@ multiprocessing.set_start_method("spawn", force=True)
 log = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-# 1. DEFINE PATHS
-BASE_DIR = os.getcwd()                # /app
-SANDBOX_DIR = os.path.join(BASE_DIR, "sandbox") # /app/sandbox
+# 1. DEFINE PATHS (Resolved to absolute, real paths)
+BASE_DIR = os.path.realpath("/app")
+SANDBOX_DIR = os.path.join(BASE_DIR, "sandbox")
+# Path where 'pip install --user' goes
+USER_LIB_DIR = os.path.realpath(os.path.join(os.environ.get("HOME", "/home/mcp-user"), ".local"))
+# Core Python Standard Libraries
+SYSTEM_LIB_DIR = os.path.realpath(f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}")
 
-# This is where 'pip' puts things. It is NOT inside /app.
-USER_LIB_DIR = os.path.join(os.environ.get("HOME", "/home/mcp-user"), ".local") 
+ALLOWED_READ_PATHS = [SANDBOX_DIR, USER_LIB_DIR, SYSTEM_LIB_DIR, "/usr/lib", "/etc/ssl"]
+ALLOWED_WRITE_PATHS = [SANDBOX_DIR, USER_LIB_DIR]
 
-# 2. THE WHITELIST
-# We allow the sandbox (data) and the libraries (tools).
-ALLOWED_PATHS = [SANDBOX_DIR, USER_LIB_DIR]
+# 2. ENVIRONMENT ALLOW-LIST
+# Only allow access to variables essential for Python/Pip to function
+ALLOWED_ENV_VARS = {
+    "PATH", "HOME", "LANG", "PYTHONPATH", 
+    "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED"
+}
 
 PRELOAD_LIBRARIES = ["math", "numpy", "sympy", "pandas"]
 PROCESSPOOL_SIZE = 4
@@ -30,73 +37,70 @@ PROCESSPOOL_SIZE = 4
 
 def audit_hook(event, args):
     # ---------------------------------------------------------
-    # 1. BLOCK SHELL INJECTION (os.system)
+    # 1. BLOCK ALL SHELL & PROCESS MORPHING
     # ---------------------------------------------------------
-    # Pip never uses os.system. This is always a user attack.
-    if event == "os.system":
-        raise PermissionError("System call 'os.system' is forbidden.")
+    # Blocks os.system, os.spawn, os.exec, and subprocess
+    if event in ("os.system", "os.exec", "os.spawn", "os.posix_spawn", "subprocess.Popen"):
+        
+        # Determine where the command arguments are based on the event
+        # For Popen and posix_spawn, args[1] is usually the argv list
+        cmd_args = args[1] if "subprocess" in event or "posix_spawn" in event else args[0]
+        
+        if not cmd_args:
+            raise PermissionError(f"Unauthorized execution attempt: {event}")
 
-    # ---------------------------------------------------------
-    # 2. CHECK PROCESS EXECUTION (Popen AND posix_spawn)
-    # ---------------------------------------------------------
-    # Python's subprocess module calls os.posix_spawn internally.
-    # We must audit both events using the same whitelist logic.
-    if event in ["subprocess.Popen", "os.posix_spawn"]:
-        
-        # Extract arguments based on the event type
-        # subprocess.Popen args: (executable, args, cwd, env)
-        # os.posix_spawn args:   (path, argv, env)
-        # In both cases, index [1] is the argument list we need to check.
-        cmd_args = args[1]
-        
-        # WHITELIST CHECK: Is this "python -m pip"?
+        # Strict Identity Check: Is this the REAL python binary?
+        requested_exe = os.path.realpath(str(cmd_args[0] if isinstance(cmd_args, list) else cmd_args))
+        actual_python = os.path.realpath(sys.executable)
+
+        # Whitelist 'python -m pip' only
         is_pip = False
-        if cmd_args and len(cmd_args) >= 3:
-            # Look for: ['/path/to/python', '-m', 'pip', ...]
-            # We check the first arg loosely (ends with python) 
-            # and the next two strictly.
-            exe = str(cmd_args[0])
-            if (exe.endswith("python") or exe.endswith(f"python{sys.version_info.major}.{sys.version_info.minor}")) and \
-               cmd_args[1] == "-m" and \
-               cmd_args[2] == "pip":
+        if requested_exe == actual_python and len(cmd_args) >= 3:
+            if cmd_args[1] == "-m" and cmd_args[2] == "pip":
                 is_pip = True
         
-        if is_pip:
-            return # ALLOW SAFE INSTALLATION
-            
-        # If it's not pip, it's a blocked command (like 'ls', 'bash', 'curl')
-        # logging.warning(f"Blocked Execution: {cmd_args}")
-        raise PermissionError(f"Process execution '{event}' is restricted to package installation.")
+        if not is_pip:
+            raise PermissionError(f"Execution blocked. '{requested_exe}' is not authorized.")
 
     # ---------------------------------------------------------
-    # 3. FILE SYSTEM CONTROL
+    # 2. FILE SYSTEM ACCESS CONTROL
     # ---------------------------------------------------------
-    if event == "open" or event == "os.listdir":
+    if event in ("open", "os.listdir", "os.scandir"):
         path = args[0]
+        # Ignore file descriptors (integers)
         if isinstance(path, int): 
             return
         
         try:
-            abs_path = os.path.abspath(path)
+            # Resolve symlinks and '..' before checking
+            target_path = os.path.realpath(path)
         except Exception:
-            return
+            raise PermissionError("Could not resolve file path safely.")
 
-        # WHITELIST CHECK
-        allowed = False
-        for safe_dir in ALLOWED_PATHS:
-            try:
-                if os.path.commonpath([safe_dir, abs_path]) == safe_dir:
-                    allowed = True
-                    break
-            except ValueError:
-                continue
-        
-        # Allow System Libraries (read-only usually)
-        if not allowed and (abs_path.startswith("/usr/lib") or abs_path.startswith("/usr/local/lib")):
-            allowed = True
+        # Check if we are attempting to write
+        mode = args[1] if event == "open" and len(args) > 1 else 'r'
+        is_write = any(m in str(mode) for m in ('w', 'a', 'x', '+'))
 
-        if not allowed:
-            raise PermissionError(f"Access to {abs_path} is denied.")
+        # Validation Logic
+        def is_subpath(p, base):
+            return p.startswith(base + os.sep) or p == base
+
+        if is_write:
+            if not any(is_subpath(target_path, d) for d in ALLOWED_WRITE_PATHS):
+                raise PermissionError(f"Write access denied: {target_path}")
+        else:
+            if not any(is_subpath(target_path, d) for d in ALLOWED_READ_PATHS):
+                # Allow access to essential dynamic loaders
+                if not target_path.startswith(("/lib", "/usr/lib")):
+                    raise PermissionError(f"Read access denied: {target_path}")
+    # --- ENVIRONMENT CONTROL ---
+    # Triggered by os.getenv() and accessing os.environ
+    if event == "os.getenv":
+        env_var_name = args[0]
+        if env_var_name not in ALLOWED_ENV_VARS:
+            # We return None or empty rather than crashing to avoid breaking 3rd party libs,
+            # but you can raise PermissionError if you want total lockdown.
+            raise PermissionError(f"Access to environment variable '{env_var_name}' is restricted.")
 
 
 def _initialize_worker_environment():
