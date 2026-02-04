@@ -1,11 +1,11 @@
 import ast
+import importlib
 import io
-from contextlib import redirect_stdout, redirect_stderr
-import subprocess
-import sys
 import logging
 import site
-import importlib
+import subprocess
+import sys
+from contextlib import redirect_stderr, redirect_stdout
 
 log = logging.getLogger(__name__)
 
