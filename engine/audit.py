@@ -1,40 +1,11 @@
-from dataclasses import dataclass
 import logging
 import os
 import sys
 from typing import Mapping
+from engine.config import config
+from engine.context import active_session_id, pip_is_active
 
 log = logging.getLogger(__name__)
-
-# --- CONFIGURATION ---
-# DEFINE PATHS (Resolved to absolute, real paths)
-BASE_DIR = os.path.realpath("/app")
-SANDBOX_DIR = os.path.join(BASE_DIR, "sandbox")
-# Path where 'pip install --user' goes
-USER_LIB_DIR = os.path.realpath(os.path.join(os.environ.get("HOME", "/home/mcp-user"), ".local"))
-# Core Python Standard Libraries
-SYSTEM_LIB_DIR = os.path.realpath(f"/usr/local/lib/python{sys.version_info.major}.{sys.version_info.minor}")
-
-ALLOWED_READ_PATHS = [SANDBOX_DIR, USER_LIB_DIR, SYSTEM_LIB_DIR, "/usr/lib", "/etc/ssl"]
-ALLOWED_WRITE_PATHS = [SANDBOX_DIR, USER_LIB_DIR]
-
-# Preload libraries into the workers
-PRELOAD_LIBRARIES = ["math", "numpy", "sympy", "pandas"]
-
-
-# --- Internal object to store secret keys ---
-# Grab your API key and any other app-specific vars before wiping the env
-@dataclass(frozen=True)
-class InternalConfig:
-    google_api_key: str | None
-
-    @classmethod
-    def from_env(cls) -> "InternalConfig":
-        return cls(
-            google_api_key=os.environ.get("GOOGLE_API_KEY"),
-        )
-    
-internal_config = InternalConfig.from_env()
 
 # These are the only variables allowed to exist in the environment
 ALLOWED_ENV = {
@@ -118,54 +89,74 @@ def audit_hook(event, args):
         except Exception:
             raise PermissionError("Could not resolve file path safely.")
 
-        # Check if we are attempting to write
-        mode = args[1] if event == "open" and len(args) > 1 else 'r'
+        # get active session id
+        sid = active_session_id.get()
+
+        # Dynamic read and write Whitelists
+        # Everyone can read system libs and their own session folder
+        read_list = [os.path.realpath(d) for d in config.allowed_read_paths]
+        write_list = []
+
+        if sid:
+            # Resolve the session-specific subfolder
+            session_dir = os.path.realpath(os.path.join(config.sandbox_dir, sid))
+            read_list.append(session_dir)
+            write_list.append(session_dir)
+            
+        # If PIP is active, unlock the library directory
+        if pip_is_active.get():
+            write_list.append(config.user_lib_dir)
+
+        # validation helper
+        def is_subpath(p, base_list):
+            for base in base_list:
+                # Check if p is exactly the directory OR is inside it
+                if p == base or p.startswith(base + os.sep):
+                    return True
+            return False
+        
+        # mode enforcement
+        mode = args[1] if (event == "open" and len(args) > 1) else 'r'
         is_write = any(m in str(mode) for m in ('w', 'a', 'x', '+'))
 
-        # Validation Logic
-        def is_subpath(p, base):
-            return p.startswith(base + os.sep) or p == base
 
         if is_write:
-            if not any(is_subpath(target_path, d) for d in ALLOWED_WRITE_PATHS):
-                raise PermissionError(f"Write access denied: {target_path}")
+            if not is_subpath(target_path, write_list):
+                # Descriptive error for debugging
+                raise PermissionError(
+                    f"Write denied to {target_path}. "
+                    f"Session: {sid}, Pip: {pip_is_active.get()}"
+                )
         else:
-            if not any(is_subpath(target_path, d) for d in ALLOWED_READ_PATHS):
-                # Allow access to essential dynamic loaders
+            if not is_subpath(target_path, read_list):
+                # Check for essential system loaders (/lib, /lib64, etc)
                 if not target_path.startswith(("/lib", "/usr/lib")):
-                    raise PermissionError(f"Read access denied: {target_path}")
-    # --- ENVIRONMENT CONTROL ---
-    # Triggered by os.getenv() and accessing os.environ
-    if event == "os.getenv":
-        env_var_name = args[0]
-        if env_var_name not in ALLOWED_ENV:
-            # We return None or empty rather than crashing to avoid breaking 3rd party libs,
-            # but you can raise PermissionError if you want total lockdown.
-            raise PermissionError(f"Access to environment variable '{env_var_name}' is restricted.")
+                    raise PermissionError(f"Read denied: {target_path}")
 
 
 def _initialize_worker_environment():
     """Sets up the sandbox and pre-loads libraries."""
     
-    # We import the executor module here. Python reads the file NOW.
+    # We import the required modules here. Python reads the file NOW.
     # Because the hook isn't active yet, this is allowed.
     try:
         import engine.executor  # noqa: F401
+        import engine.session  # noqa: F401
     except ImportError as e:
-        log.error(f"Failed to preload executor: {e}")
+        log.error(f"Failed to preload libraries: {e}")
         raise
 
     # 2. Warm up libraries (Pandas, Numpy, etc.)
-    for lib in PRELOAD_LIBRARIES:
+    for lib in config.preload_libraries:
         try:
             __import__(lib)
         except ImportError:
             pass
 
     # 3. Enforce Sandbox (Move to directory)
-    if not os.path.exists(SANDBOX_DIR):
-        os.makedirs(SANDBOX_DIR, exist_ok=True)
-    os.chdir(SANDBOX_DIR)
+    if not os.path.exists(config.sandbox_dir):
+        os.makedirs(config.sandbox_dir, exist_ok=True)
+    os.chdir(config.sandbox_dir)
     
     # 4. LOCK THE DOOR (Activate the Hook)
     # From this point on, NO new files outside SANDBOX_DIR can be opened.

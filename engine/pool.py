@@ -3,6 +3,7 @@ import logging
 import multiprocessing
 import os
 import signal
+import time
 import uuid
 from multiprocessing.connection import Connection
 from typing import Any, Callable, Optional, Tuple
@@ -26,7 +27,8 @@ def worker_main(task_conn: Connection, result_conn: Connection):
         format=f'[Worker-{os.getpid()}] %(name)s - %(levelname)s - %(message)s',
         force=True # Overwrite any default settings
     )
-
+    # This dictionary survives as long as the worker process lives
+    session_storage = {}
     # --- INITIALIZATION ---
     try:
         _initialize_worker_environment()
@@ -38,12 +40,21 @@ def worker_main(task_conn: Connection, result_conn: Connection):
         try:
             # Wait for a task
             fn, args, kwargs, task_id = result_conn.recv()
+            session_id = kwargs.get('session_id')
         except EOFError:
             break
 
         try:
-            # Execute the function passed from the main process
-            # This 'fn' will be our 'execute_user_code' function
+            # Retrieve or create the persistent globals for this session
+            if session_id not in session_storage:
+                session_storage[session_id] = {
+                    "__name__": "__main__",
+                    "__builtins__": __builtins__
+                }
+            
+            # Pass the persistent dictionary to your execute_user_code function
+            kwargs['persistent_namespace'] = session_storage[session_id]
+            
             output = fn(*args, **kwargs)
             result_conn.send((task_id, "ok", output))
         except Exception as exc:
@@ -110,6 +121,10 @@ class WorkerPool:
         self.bouncer = asyncio.BoundedSemaphore(max_backlog)
         self.workers = [Worker(i) for i in range(size)]
         self.available_workers = asyncio.Queue()
+        self.session_to_wid = {} # { session_id: worker_index }
+        # A helper to find the worker object by its ID
+        self.wid_map = {w.wid: w for w in self.workers}
+        self.session_activity = {}  # { session_id: last_timestamp }
 
         for w in self.workers:
             self.available_workers.put_nowait(w)
@@ -125,7 +140,13 @@ class WorkerPool:
             f"Idle/Queue: {idle_count}"
         )
 
-    async def run(self, fn: Callable, execution_timeout: float = 5.0, queue_timeout: float = 30.0, bouncer_timeout: float = 1.0, *args, **kwargs) -> Tuple[int, Any]:
+    async def run(self, 
+                  fn: Callable, 
+                  session_id: str, 
+                  execution_timeout: float = 5.0, 
+                  queue_timeout: float = 30.0, 
+                  bouncer_timeout: float = 1.0, 
+                  *args, **kwargs) -> Tuple[int, Any]:
         """Executes the function in a sub process.
         
         Args:
@@ -145,16 +166,25 @@ class WorkerPool:
             raise RuntimeError("Server overloaded: Please try again later.")
         
         try:
-            return await self._execute_task(fn, execution_timeout, queue_timeout, *args, **kwargs)
+            return await self._execute_task(fn, session_id, execution_timeout, queue_timeout, *args, **kwargs)
         finally:
             self.bouncer.release()
 
 
-    async def _execute_task(self, fn, exec_timeout, q_timeout, *args, **kwargs):
-        # --- PHASE 1: ACQUIRE WORKER ---
+    async def _execute_task(self, fn, sid, exec_timeout, q_timeout, *args, **kwargs):
+        self.session_activity[sid] = time.time()
+        # --- PHASE 1: ACQUIRE MAPPED WORKER ---
+        # 1. Determine which worker handles this session
+        if sid in self.session_to_wid:
+            wid = self.session_to_wid[sid]
+        else:
+            # New session: Assign using a simple hash (Round Robin)
+            wid = hash(sid) % self.size
+            self.session_to_wid[sid] = wid
+        w: Worker = self.wid_map[wid]
         try:
-            # log.info("WAITING FOR AVAILABLE WORKER")
-            w: Worker = await asyncio.wait_for(self.available_workers.get(), timeout=q_timeout)
+            # We use wait_for on the lock acquisition itself to respect your q_timeout
+            await asyncio.wait_for(w.lock.acquire(), timeout=q_timeout)
         except asyncio.TimeoutError:
             log.error(f"Queue Timeout: Waited {q_timeout}s but no workers became free.")
             raise RuntimeError("Server busy: Could not acquire worker in time.")
@@ -164,68 +194,66 @@ class WorkerPool:
 
         # --- PHASE 2: EXECUTE ---
         # The 'execution_timeout' ONLY applies to this block.
-        async with w.lock:
-            try:
-                task_id = str(uuid.uuid4())
-                log.info(f"Sending '{fn.__name__}' execution task to (uvicorn_pid: {os.getpid()}, worker_id: {w.wid})")    # testing
-                # Send the task
-                w.parent_conn.send((fn, args, kwargs, task_id))
+        try:
+            if not w.is_alive():
+                log.warning(f"Worker {w.wid} was dead. Restarting before task.")
+                w.restart()
+            task_id = str(uuid.uuid4())
+            log.info(f"Sending '{fn.__name__}' execution task to (uvicorn_pid: {os.getpid()}, worker_id: {w.wid})")    # testing
+            # Inject session_id so worker_main knows which namespace to use
+            kwargs['session_id'] = sid
+            # Send the task
+            w.parent_conn.send((fn, args, kwargs, task_id))
 
-                # Wait for result strictly with execution_timeout
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(w.parent_conn.recv),
-                    timeout=exec_timeout,
-                )
-                
-                got_id, status, output = result
-                
-                if got_id != task_id:
-                    log.warning(f"ID MISMATCH on Worker {w.wid}. Restarting...")
-                    w.restart() 
-                    raise RuntimeError("Task ID mismatch! Restarted worker.")
-
-                if status == "ok":
-                    return w.wid, output
-                else:
-                    raise RuntimeError(output)
-
-            # --- ERROR HANDLING ---
+            # Wait for result strictly with execution_timeout
+            result = await asyncio.wait_for(
+                asyncio.to_thread(w.parent_conn.recv),
+                timeout=exec_timeout,
+            )
             
-            except asyncio.TimeoutError:
-                # 1. ACTUAL EXECUTION TIMEOUT
-                # The worker took too long to calculate. It might be stuck.
-                log.warning(f"EXECUTION TIMEOUT ({exec_timeout}s) on Worker {w.wid}. Restarting...")
-                w.restart()
-                self._print_status(f"RESTART: EXEC TIMEOUT WID {w.wid}")
-                raise TimeoutError(f"Task execution timed out after {exec_timeout}s")
-
-            except asyncio.CancelledError:
-                # 2. CLIENT DISCONNECT / OUTER TIMEOUT
-                # The user closed the connection, but the worker is still crunching data.
-                # We MUST restart it, otherwise it stays busy with a dead task.
-                log.warning(f"Task Cancelled on Worker {w.wid}. Restarting to clear state...")
-                w.restart()
-                raise 
-
-            except (EOFError, BrokenPipeError, ConnectionResetError, OSError) as e:
-                if self._shutting_down:
-                    log.info(f"Worker {w.wid} killed during shutdown. Not restarting.")
-                    raise RuntimeError("System shutting down")
-                # 3. WORKER CRASH
-                log.warning(f"[Worker Crash] Worker {w.wid} died. Restarting.")
-                w.restart()
-                self._print_status(f"RESTART: CRASH WID {w.wid}")
-                raise RuntimeError(f"Worker {w.wid} died unexpectedly") from e
+            got_id, status, output = result
             
-            finally:
-                # --- PHASE 3: RETURN WORKER ---
-                # We only put the worker back if we didn't crash explicitly before restart logic
-                # (The restart methods above handle internal state, so 'w' is safe to return)
-                if w.is_alive():
-                    self.available_workers.put_nowait(w)
-                else:
-                    # edge case: OOM
-                    log.critical(f"Worker {w.wid} is dead and could not be restarted. Removing from pool.")
+            if got_id != task_id:
+                log.warning(f"ID MISMATCH on Worker {w.wid}. Restarting...")
+                w.restart() 
+                raise RuntimeError("Task ID mismatch! Restarted worker.")
+
+            if status == "ok":
+                return w.wid, output
+            else:
+                raise RuntimeError(output)
+
+        # --- ERROR HANDLING ---
+        
+        except asyncio.TimeoutError:
+            # 1. ACTUAL EXECUTION TIMEOUT
+            # The worker took too long to calculate. It might be stuck.
+            log.warning(f"EXECUTION TIMEOUT ({exec_timeout}s) on Worker {w.wid}. Restarting...")
+            w.restart()
+            self._print_status(f"RESTART: EXEC TIMEOUT WID {w.wid}")
+            raise TimeoutError(f"Task execution timed out after {exec_timeout}s")
+
+        except asyncio.CancelledError:
+            # 2. CLIENT DISCONNECT / OUTER TIMEOUT
+            # The user closed the connection, but the worker is still crunching data.
+            # We MUST restart it, otherwise it stays busy with a dead task.
+            log.warning(f"Task Cancelled on Worker {w.wid}. Restarting to clear state...")
+            w.restart()
+            raise 
+
+        except (EOFError, BrokenPipeError, ConnectionResetError, OSError) as e:
+            if self._shutting_down:
+                log.info(f"Worker {w.wid} killed during shutdown. Not restarting.")
+                raise RuntimeError("System shutting down")
+            # 3. WORKER CRASH
+            log.warning(f"[Worker Crash] Worker {w.wid} died. Restarting.")
+            w.restart()
+            self._print_status(f"RESTART: CRASH WID {w.wid}")
+            raise RuntimeError(f"Worker {w.wid} died unexpectedly") from e
+        
+        finally:
+            # --- PHASE 3: RELEASE ---
+            w.lock.release()
 
     def shutdown(self):
         self._shutting_down = True

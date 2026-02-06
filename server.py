@@ -1,4 +1,6 @@
+import asyncio
 from engine.pool import start_worker_pool, get_worker_pool, stop_worker_pool
+from engine.session import session_reaper
 from engine.executor import execute_user_code
 from engine.utils import get_missing_imports
 from fastmcp import FastMCP
@@ -22,6 +24,7 @@ EXECUTION_TIMEOUT = 5
 QUEUE_TIMEOUT = 50
 BACKLOG_TIMEOUT = 1.0
 INSTALL_TIMEOUT = 120
+IDLE_TIMEOUT = 300
 
 
 @asynccontextmanager
@@ -29,12 +32,24 @@ async def server_lifespan(server: FastMCP):
     # 1. Startup Logic
     logger.info("🚀 Lifespan: Starting Worker Pool...")
     start_worker_pool(max_workers=MAX_WORKERS, max_backlog=MAX_BACKLOG)
+    pool = get_worker_pool()
     
-    yield  # Server is running here
+    # --- Start reaper in the background ---
+    reaper_task = asyncio.create_task(session_reaper(pool, IDLE_TIMEOUT))
     
-    # 2. Shutdown Logic
-    logger.info("🛑 Lifespan: Shutting down Worker Pool...")
-    stop_worker_pool()
+    try:
+        yield  # Server runs here
+    finally:
+        # 2. Shutdown Logic
+        logger.info("🛑 Lifespan: Cleaning up background tasks...")
+        reaper_task.cancel()
+        try:
+            await reaper_task
+        except asyncio.CancelledError:
+            pass
+            
+        logger.info("🛑 Lifespan: Shutting down Worker Pool...")
+        stop_worker_pool()
 
 
 mcp = FastMCP("mcp-code-exec", lifespan=server_lifespan)
@@ -42,7 +57,8 @@ mcp = FastMCP("mcp-code-exec", lifespan=server_lifespan)
 
 @mcp.tool(name="python-execute")
 async def execute_python_code(
-        code: Annotated[str, Field(description="Python code")]
+        code: Annotated[str, Field(description="Python code")],
+        session_id: Annotated[str, Field(description="Session ID")]
 ) -> dict:
     """
     Code execution sandbox. Returns `stdout` and `stderr`.
@@ -66,7 +82,8 @@ async def execute_python_code(
             queue_timeout=QUEUE_TIMEOUT,
             # Pass arguments to the function
             code=code,
-            packages_to_install=missing_libs
+            session_id=session_id,
+            packages_to_install=missing_libs,
         )
         return res
 

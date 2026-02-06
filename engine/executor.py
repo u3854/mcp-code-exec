@@ -6,61 +6,80 @@ import site
 import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
+from engine.context import active_session_id, pip_is_active
+from engine.config import config
+import os
 
 log = logging.getLogger(__name__)
 
-def execute_user_code(code: str, packages_to_install: list[str] = None) -> dict:
+def execute_user_code(code: str, 
+                      session_id: str, 
+                      packages_to_install: list[str] = None,
+                      persistent_namespace: dict = None) -> dict:
     
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
+    # Set the identity for the audit hook
+    token_sid = active_session_id.set(session_id)
 
     try:
+        # CREATE SESSION SANDBOX
+        session_dir = os.path.realpath(os.path.join(config.sandbox_dir, session_id))
+        os.makedirs(session_dir, exist_ok=True)
+        os.chdir(session_dir)
+
         # --- INSTALLATION PHASE ---
         if packages_to_install:
             # print(f"[System] Installing packages: {', '.join(packages_to_install)}...", file=stderr_buf)
-            
-            # 1. Run Install
-            log.info(f"Installing missing packages: {packages_to_install}")
-            cmd = [sys.executable, "-m", "pip", "install", "--user"] + packages_to_install
-            proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
-            if proc.returncode != 0:
-                return {"status": "error", "error": f"Install Failed:\n{proc.stderr}"}
-            
-            # print(proc.stdout, file=stdout_buf) # Log install output
-            log.info("Intstallation complete.")
+            # UNLOCK the library directory
+            token_pip = pip_is_active.set(True)
+            try:
+                # 1. Run Install
+                log.info(f"Installing missing packages: {packages_to_install}")
+                cmd = [sys.executable, "-m", "pip", "install", "--user"] + packages_to_install
+                proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                if proc.returncode != 0:
+                    return {"status": "error", "error": f"Install Failed:\n{proc.stderr}"}
+                
+                # print(proc.stdout, file=stdout_buf) # Log install output
+                log.info("Intstallation complete.")
 
-            # 2. DYNAMIC DISCOVERY (The Fix)
-            # Instead of guessing the path, we ask pip where it put the first package.
-            # This handles 'dist-packages' vs 'site-packages' and python versioning automatically.
-            pkg_name = packages_to_install[0]
-            show_cmd = [sys.executable, "-m", "pip", "show", pkg_name]
-            show_proc = subprocess.run(show_cmd, capture_output=True, text=True)
-            
-            new_site_path = None
-            for line in show_proc.stdout.splitlines():
-                if line.startswith("Location:"):
-                    # Extract the path (e.g., "Location: /home/user/.local/lib/...")
-                    new_site_path = line.split(":", 1)[1].strip()
-                    break
-            
-            # 3. Inject the path
-            if new_site_path:
-                # Use insert(0) to force priority over system packages
-                if new_site_path not in sys.path:
-                    sys.path.insert(0, new_site_path)
-                    site.addsitedir(new_site_path) # Handles .pth files correctly
-                    # print(f"[System] Discovered and added lib path: {new_site_path}", file=stderr_buf)
-            else:
-                _ = f"[System] Warning: Could not auto-detect install location for {pkg_name}"
-                log.warning(_)
-                print(_, file=stderr_buf)
+                # 2. DYNAMIC DISCOVERY (The Fix)
+                # Instead of guessing the path, we ask pip where it put the first package.
+                # This handles 'dist-packages' vs 'site-packages' and python versioning automatically.
+                pkg_name = packages_to_install[0]
+                show_cmd = [sys.executable, "-m", "pip", "show", pkg_name]
+                show_proc = subprocess.run(show_cmd, capture_output=True, text=True)
+                
+                new_site_path = None
+                for line in show_proc.stdout.splitlines():
+                    if line.startswith("Location:"):
+                        # Extract the path (e.g., "Location: /home/user/.local/lib/...")
+                        new_site_path = line.split(":", 1)[1].strip()
+                        break
+                
+                # 3. Inject the path
+                if new_site_path:
+                    # Use insert(0) to force priority over system packages
+                    if new_site_path not in sys.path:
+                        sys.path.insert(0, new_site_path)
+                        site.addsitedir(new_site_path) # Handles .pth files correctly
+                        # print(f"[System] Discovered and added lib path: {new_site_path}", file=stderr_buf)
+                else:
+                    _ = f"[System] Warning: Could not auto-detect install location for {pkg_name}"
+                    log.warning(_)
+                    print(_, file=stderr_buf)
 
-            # 4. Invalidate caches so imports work immediately
-            importlib.invalidate_caches()
+                # 4. Invalidate caches so imports work immediately
+                importlib.invalidate_caches()
+            finally:
+                pip_is_active.reset(token_pip)
 
 
         # --- EXECUTION PHASE ---
+        namespace = persistent_namespace if persistent_namespace is not None else {"__name__": "__main__"}
+
         tree = ast.parse(code)
         
         # Transform last node to print()
@@ -79,7 +98,7 @@ def execute_user_code(code: str, packages_to_install: list[str] = None) -> dict:
         compiled = compile(tree, filename="<string>", mode="exec")
         
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-            exec(compiled, {"__name__": "__main__"})
+            exec(compiled, namespace)
             
         return {
             "stdout": stdout_buf.getvalue(),
@@ -95,3 +114,6 @@ def execute_user_code(code: str, packages_to_install: list[str] = None) -> dict:
             "error": str(e),
             "status": "error"
         }
+    finally:
+        active_session_id.reset(token_sid)
+        os.chdir(config.sandbox_dir)
