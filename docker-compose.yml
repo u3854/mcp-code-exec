@@ -6,9 +6,8 @@ services:
     image: mcp-code-exec:latest
     container_name: mcp-code-exec
     
-    # Map port 8000 inside the container to 8000 on your host
     ports:
-      - "8000:8000"
+      - "8001:8001"
 
     # Environment variables for configuration
     # environment:
